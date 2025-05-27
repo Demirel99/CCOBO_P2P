@@ -7,11 +7,13 @@ import torch
 
 # --- Dataset Paths ---
 # Adjust these paths based on your environment
+# For better portability, consider using environment variables or relative paths.
 BASE_DATA_DIR = "C:\\Users\\Mehmet_Postdoc\\Desktop\\datasets_for_experiments\\ShanghaiTech_Crowd_Counting_Dataset" # Base directory after unzipping
 IMAGE_DIR_TRAIN_VAL = os.path.join(BASE_DATA_DIR, "part_A_final\\train_data\\images")
 GT_DIR_TRAIN_VAL = os.path.join(BASE_DATA_DIR, "part_A_final\\train_data\\ground_truth")
 IMAGE_DIR_TEST = os.path.join(BASE_DATA_DIR, "part_A_final\\test_data\\images")
 GT_DIR_TEST = os.path.join(BASE_DATA_DIR, "part_A_final\\test_data\\ground_truth")
+# For better portability, consider using environment variables or relative paths.
 OUTPUT_DIR = "C:\\Users\\Mehmet_Postdoc\\Desktop\\python_set_up_code\\iterative_crowd_counting\\crowd_counting_outputs" # For logs, plots, models
 
 # --- Data Preprocessing ---
@@ -29,9 +31,6 @@ VALIDATION_INTERVAL = 100 # How often to run validation
 VALIDATION_BATCHES = 50 # Number of batches for validation evaluation
 SCHEDULER_PATIENCE = 10 # ReduceLROnPlateau patience (in terms of validation intervals)
 SEED = 42
-
-# --- Model ---
-PSF_HEAD_TEMP = 0.1 # Temperature for softmax in PSFHead (Unused in coordinate regression head)
 
 # --- Device ---
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")

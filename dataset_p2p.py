@@ -14,7 +14,7 @@ import matplotlib.pyplot as plt # Added for test code
 from matplotlib.patches import Circle # For plotting points
 
 # Import from config
-from config import (AUGMENTATION_SIZE, MODEL_INPUT_SIZE, MIN_DIM_RESCALE, GT_PSF_SIGMA, IMAGE_DIR_TRAIN_VAL, GT_DIR_TRAIN_VAL, DEVICE)
+from config_p2p import (AUGMENTATION_SIZE, MODEL_INPUT_SIZE, MIN_DIM_RESCALE, GT_PSF_SIGMA, IMAGE_DIR_TRAIN_VAL, GT_DIR_TRAIN_VAL, DEVICE)
 
 
 # --- ImageNet Mean/Std for Normalization ---
@@ -94,7 +94,14 @@ def prepare_data_augmentations(image, gt_coor, target_size=AUGMENTATION_SIZE, mi
         final_h, final_w = target_size, target_size
     else:
         # If image is smaller than target_size after scaling, resize up (less ideal than padding)
-        print(f"Warning: Scaled image ({curr_h}x{curr_w}) smaller than target ({target_size}x{target_size}). Resizing up.")
+        # This might distort aspect ratio if scaled_image is not square.
+        # For aspect-ratio preserving upscale with padding:
+        # 1. Calculate new_h, new_w to fit within target_size while maintaining aspect ratio.
+        # 2. Resize to new_h, new_w.
+        # 3. Create a target_size canvas and paste the resized image.
+        # 4. Adjust coordinates for padding.
+        # Current simpler method:
+        print(f"Warning: Scaled image ({curr_h}x{curr_w}) smaller than target ({target_size}x{target_size}). Resizing up (may distort aspect ratio).")
         try:
              cropped_image = cv2.resize(scaled_image, (target_size, target_size), interpolation=cv2.INTER_LINEAR)
         except cv2.error as e:
@@ -153,23 +160,9 @@ def get_center_crop_coords(image_size, crop_size):
     start_x = max(0, (img_w - crop_w) // 2)
     return start_y, start_x
 
-def check_any_coord_in_center(coordinates, image_shape, center_crop_shape):
-    """Checks if at least one coordinate falls within the central crop area."""
-    if coordinates is None or coordinates.shape[0] == 0: return False
-    img_h, img_w = image_shape
-    crop_h, crop_w = center_crop_shape
-    start_y, start_x = get_center_crop_coords(image_shape, center_crop_shape)
-    end_y, end_x = start_y + crop_h, start_x + crop_w
-
-    for x, y in coordinates:
-        if start_x <= x < end_x and start_y <= y < end_y:
-            return True
-    return False
-
-
-def get_random_coord_index_in_center(coordinates, image_shape, center_crop_shape):
-    """Gets the index of a random coordinate falling within the central crop."""
-    if coordinates is None or coordinates.shape[0] == 0: return None
+def get_coords_in_center_crop(coordinates, image_shape, center_crop_shape):
+    """Returns indices of coordinates falling within the central crop area."""
+    if coordinates is None or coordinates.shape[0] == 0: return []
     img_h, img_w = image_shape
     crop_h, crop_w = center_crop_shape
     start_y, start_x = get_center_crop_coords(image_shape, center_crop_shape)
@@ -179,7 +172,7 @@ def get_random_coord_index_in_center(coordinates, image_shape, center_crop_shape
         i for i, (x, y) in enumerate(coordinates)
         if start_x <= x < end_x and start_y <= y < end_y
     ]
-    return random.choice(indices_in_center) if indices_in_center else None
+    return indices_in_center
 
 
 def generate_train_sample(image_paths, gt_paths, augment_size=AUGMENTATION_SIZE, model_input_size=MODEL_INPUT_SIZE, psf_sigma=GT_PSF_SIGMA):
@@ -192,14 +185,19 @@ def generate_train_sample(image_paths, gt_paths, augment_size=AUGMENTATION_SIZE,
         rand_idx = random.randint(0, len(image_paths) - 1)
         image_path = image_paths[rand_idx]
         img_filename = os.path.basename(image_path)
-        gt_filename = "GT_" + os.path.splitext(img_filename)[0] + ".mat"
-        gt_path = os.path.join(os.path.dirname(gt_paths[0]) if gt_paths else os.path.dirname(image_path).replace("images", "ground_truth"), gt_filename) # Heuristic
+        
+        # Primary GT path generation
+        gt_filename_expected = "GT_" + os.path.splitext(img_filename)[0] + ".mat"
+        gt_path_base = os.path.dirname(gt_paths[0]) if gt_paths else os.path.dirname(image_path).replace("images", "ground_truth") # Heuristic for base GT dir
+        gt_path = os.path.join(gt_path_base, gt_filename_expected)
 
         if not os.path.exists(gt_path):
+             # Fallback to indexed path if primary not found
              if rand_idx < len(gt_paths) and os.path.exists(gt_paths[rand_idx]):
                  gt_path = gt_paths[rand_idx]
+                 # print(f"Note: GT file {gt_filename_expected} not found, using indexed GT path {gt_path} for {image_path}.")
              else:
-                 print(f"Warning: GT file not found for {image_path} (tried {gt_filename} and indexed). Skipping.")
+                 print(f"Warning: GT file for {image_path} not found. Tried {gt_filename_expected} in {gt_path_base} and indexed lookup. Skipping.")
                  continue
 
         image = cv2.imread(image_path)
@@ -224,7 +222,9 @@ def generate_train_sample(image_paths, gt_paths, augment_size=AUGMENTATION_SIZE,
                  for key, value in mat_data.items():
                      if isinstance(value, np.ndarray) and len(value.shape) == 2 and value.shape[1] == 2:
                          gt_coor = value.astype(np.float32); found_coords = True; break
-                 if not found_coords: print(f"Warning: No coord data in {gt_path}. Skipping."); continue
+                 if not found_coords: 
+                     print(f"Warning: No coordinate data (e.g. 'annPoints' or 'image_info') in {gt_path}. Skipping.")
+                     continue
         except Exception as e:
              print(f"Warning: Error loading/parsing .mat {gt_path}: {e}. Skipping.")
              continue
@@ -237,31 +237,24 @@ def generate_train_sample(image_paths, gt_paths, augment_size=AUGMENTATION_SIZE,
         img_h, img_w = aug_image.shape[:2]
         if img_h == 0 or img_w == 0: continue
 
-        center_crop_shape = (model_input_size, model_input_size)
-        if not check_any_coord_in_center(aug_gt_coor, (img_h, img_w), center_crop_shape): continue
-
-        target_coord_idx_in_aug = get_random_coord_index_in_center(aug_gt_coor, (img_h, img_w), center_crop_shape)
-        if target_coord_idx_in_aug is None: continue
-
-        # Sort points
+        # Sort all augmented ground truth points
+        # Sort by y descending (bottom-first), then x ascending (left-first)
         sorted_indices = np.lexsort((aug_gt_coor[:, 0], -aug_gt_coor[:, 1]))
         sorted_aug_gt_coor = aug_gt_coor[sorted_indices]
 
-        # Find the index of our chosen target point *within the sorted list*
-        # The chosen target point was originally aug_gt_coor[target_coord_idx_in_aug]
-        chosen_target_coord_value = aug_gt_coor[target_coord_idx_in_aug]
+        center_crop_shape = (model_input_size, model_input_size)
         
-        sorted_target_idx = -1
-        for i, coord in enumerate(sorted_aug_gt_coor):
-             if np.allclose(coord, chosen_target_coord_value, atol=1e-4):
-                 sorted_target_idx = i
-                 break
-        if sorted_target_idx == -1:
-            print(f"Warning: Could not find chosen target in sorted list for {image_path}. Skipping.")
-            continue
-        
-        timestep = sorted_target_idx # This is the index of the target point in the *sorted* list
+        # Find indices of points in the *sorted* list that fall within the central crop area of aug_image
+        indices_of_sorted_coords_in_center = get_coords_in_center_crop(
+            sorted_aug_gt_coor, (img_h, img_w), center_crop_shape
+        )
 
+        if not indices_of_sorted_coords_in_center: continue # No points in the center crop
+
+        # Randomly select one of these points as the target
+        # Its index in `sorted_aug_gt_coor` is our `timestep`
+        timestep = random.choice(indices_of_sorted_coords_in_center)
+        
         # Generate input PSF (sum of PSFs *before* the target in sorted list)
         input_psf_full = np.zeros((img_h, img_w), dtype=np.float32)
         if timestep > 0:
@@ -276,7 +269,8 @@ def generate_train_sample(image_paths, gt_paths, augment_size=AUGMENTATION_SIZE,
         end_y, end_x = start_y + model_input_size, start_x + model_input_size
 
         if start_y < 0 or start_x < 0 or end_y > img_h or end_x > img_w:
-            print(f"Warning: Invalid crop coordinates for {image_path}. Skipping.")
+            # This case should be rare if `get_coords_in_center_crop` is correct and aug_image is >= model_input_size
+            print(f"Warning: Invalid crop coordinates for {image_path}. Aug_shape: {(img_h, img_w)}, Crop: {center_crop_shape}. Skipping.")
             continue
 
         final_image = aug_image[start_y:end_y, start_x:end_x]
@@ -287,22 +281,21 @@ def generate_train_sample(image_paths, gt_paths, augment_size=AUGMENTATION_SIZE,
         target_coord_cropped_y = actual_target_coord_in_aug[1] - start_y
 
         # Ensure target coordinates are within the cropped image bounds
-        # (They should be if get_random_coord_index_in_center worked correctly)
+        # (They should be if selection logic for `timestep` worked correctly)
         if not (0 <= target_coord_cropped_x < model_input_size and \
                 0 <= target_coord_cropped_y < model_input_size):
             print(f"Warning: Target coordinate ({target_coord_cropped_x:.2f}, {target_coord_cropped_y:.2f}) "
-                  f"is outside final crop {center_crop_shape} for {image_path}. Skipping.")
+                  f"is outside final crop {center_crop_shape} for {image_path}. Coords in aug: {actual_target_coord_in_aug}, start: ({start_x},{start_y}). Skipping.")
             continue
             
-        # final_target_coords = np.array([target_coord_cropped_x, target_coord_cropped_y], dtype=np.float32)
         # NORMALIZE coordinates to [0, 1]
-        norm_target_x = target_coord_cropped_x / (model_input_size -1) # or just model_input_size
-        norm_target_y = target_coord_cropped_y / (model_input_size -1) # or just model_input_size
+        norm_target_x = target_coord_cropped_x / (model_input_size -1) if model_input_size > 1 else 0.0
+        norm_target_y = target_coord_cropped_y / (model_input_size -1) if model_input_size > 1 else 0.0
         final_target_coords_normalized = np.array([norm_target_x, norm_target_y], dtype=np.float32)
 
         # Verify shapes
         if final_image.shape[:2] != center_crop_shape or final_input_psf.shape != center_crop_shape:
-            print(f"Warning: Cropped shape mismatch for {image_path}. Skipping.")
+            print(f"Warning: Cropped shape mismatch for {image_path}. Img: {final_image.shape[:2]}, PSF: {final_input_psf.shape}. Target: {center_crop_shape}. Skipping.")
             continue
 
         # Normalize Image and Input PSF
@@ -314,9 +307,7 @@ def generate_train_sample(image_paths, gt_paths, augment_size=AUGMENTATION_SIZE,
         final_input_psf_tensor = torch.from_numpy(final_input_psf).float().unsqueeze(0)
 
         # Target Coordinates Tensor
-        # final_target_coords_tensor = torch.from_numpy(final_target_coords).float() # Shape (2,)
         final_target_coords_tensor = torch.from_numpy(final_target_coords_normalized).float() # Shape (2,)
-
 
         # Final safety check
         expected_img_shape = (3, model_input_size, model_input_size)
@@ -324,7 +315,7 @@ def generate_train_sample(image_paths, gt_paths, augment_size=AUGMENTATION_SIZE,
         if final_image_tensor.shape != expected_img_shape or \
            final_input_psf_tensor.shape != expected_psf_shape or \
            final_target_coords_tensor.shape != (2,):
-            print(f"Warning: Final shape mismatch for {image_path}. Retrying.")
+            print(f"Warning: Final shape mismatch for {image_path}. Retrying. Img: {final_image_tensor.shape}, PSF: {final_input_psf_tensor.shape}, Tgt: {final_target_coords_tensor.shape}")
             continue
             
         return final_image_tensor, final_input_psf_tensor, final_target_coords_tensor
@@ -416,14 +407,19 @@ if __name__ == "__main__":
         print(f"Generated Tensor Shapes:")
         print(f"  Image:          {img_tensor.shape}")
         print(f"  Input PSF:      {input_psf_tensor.shape}")
-        print(f"  Target Coords:  {target_coords_tensor.shape}, Value: {target_coords_tensor.numpy()}") # MODIFIED
+        print(f"  Target Coords:  {target_coords_tensor.shape}, Value (normalized): {target_coords_tensor.numpy()}") # MODIFIED
 
         img_vis = img_tensor.cpu() * IMG_STD.cpu() + IMG_MEAN.cpu()
         img_vis = torch.clamp(img_vis, 0, 1)
         img_vis_np = img_vis.permute(1, 2, 0).numpy()
 
         input_psf_np = input_psf_tensor.squeeze().cpu().numpy()
-        target_coords_np = target_coords_tensor.cpu().numpy() # MODIFIED (x, y)
+        target_coords_normalized_np = target_coords_tensor.cpu().numpy() # (x_norm, y_norm)
+
+        # Denormalize coordinates for visualization on the model input image
+        target_pixel_x = target_coords_normalized_np[0] * (MODEL_INPUT_SIZE - 1) if MODEL_INPUT_SIZE > 1 else 0
+        target_pixel_y = target_coords_normalized_np[1] * (MODEL_INPUT_SIZE - 1) if MODEL_INPUT_SIZE > 1 else 0
+
 
         fig, axes = plt.subplots(1, 2, figsize=(12, 6)) # MODIFIED (1 row, 2 cols)
         fig.suptitle(f'Generated Sample {i+1} (Coordinate Regression)', fontsize=16)
@@ -431,10 +427,10 @@ if __name__ == "__main__":
         axes[0].imshow(img_vis_np)
         axes[0].set_title(f'Input Image ({MODEL_INPUT_SIZE}x{MODEL_INPUT_SIZE})')
         # Plot target coordinate as a red circle
-        target_circle = Circle((target_coords_np[0], target_coords_np[1]), radius=5, color='red', fill=False, linewidth=2)
+        target_circle = Circle((target_pixel_x, target_pixel_y), radius=5, color='red', fill=False, linewidth=2)
         axes[0].add_patch(target_circle)
-        axes[0].text(target_coords_np[0] + 7, target_coords_np[1] + 7, 
-                     f'Target\n({target_coords_np[0]:.1f}, {target_coords_np[1]:.1f})', 
+        axes[0].text(target_pixel_x + 7, target_pixel_y + 7, 
+                     f'Target\n({target_pixel_x:.1f}, {target_pixel_y:.1f})', 
                      color='red', fontsize=9, bbox=dict(facecolor='white', alpha=0.7, pad=1))
         axes[0].axis('off')
 

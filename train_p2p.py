@@ -10,6 +10,7 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 import numpy as np
 import random
+import json # For logging config
 
 from config_p2p import (
     DEVICE, SEED, TOTAL_ITERATIONS, BATCH_SIZE, LEARNING_RATE, WEIGHT_DECAY,
@@ -22,9 +23,35 @@ from dataset_p2p import generate_batch, generate_train_sample
 from model_p2p import VGG19FPNASPP
 from losses_p2p import coordinate_regression_loss # MODIFIED
 
+def log_hyperparameters(log_file_path, config_module):
+    """Logs hyperparameters from the config module to the log file."""
+    hyperparams = {
+        key: getattr(config_module, key)
+        for key in dir(config_module)
+        if not key.startswith("__") and not callable(getattr(config_module, key))
+        and isinstance(getattr(config_module, key), (int, float, str, list, dict, tuple, bool, torch.device)) # Filter for common types
+    }
+    # Convert device to string for JSON serialization
+    if 'DEVICE' in hyperparams and isinstance(hyperparams['DEVICE'], torch.device):
+        hyperparams['DEVICE'] = str(hyperparams['DEVICE'])
+        
+    with open(log_file_path, "a") as log_file:
+        log_file.write("--- Hyperparameters ---\n")
+        log_file.write(json.dumps(hyperparams, indent=4))
+        log_file.write("\n--- Training Log ---\n")
+
 def train():
     print("Setting up training (Coordinate Regression Mode)...")
     set_seed(SEED)
+
+    if os.path.exists(LOG_FILE_PATH):
+        try: os.remove(LOG_FILE_PATH)
+        except OSError as e: print(f"Warning: Could not remove existing log file: {e}")
+    
+    # Log hyperparameters first
+    import config_p2p as cfg # Import config module to pass to logger
+    log_hyperparameters(LOG_FILE_PATH, cfg)
+
 
     sorted_image_paths_train_val = find_and_sort_paths(IMAGE_DIR_TRAIN_VAL, '*.jpg')
     # For GT paths, dataset.py handles matching, so a placeholder list or actual list can be used
@@ -46,7 +73,19 @@ def train():
         raise ValueError("Train or validation set is empty after splitting.")
 
     model = VGG19FPNASPP().to(DEVICE)
+    
+    # For potential future improvement: Different learning rates for backbone vs. other parts
+    # Example:
+    # optimizer = optim.AdamW([
+    #     {'params': model.image_encoder.parameters(), 'lr': LEARNING_RATE * 0.1},
+    #     {'params': model.mask_encoder.parameters()},
+    #     {'params': model.fusion_conv_c5.parameters()},
+    #     {'params': model.aspp_c5.parameters()},
+    #     {'params': model.fpn_decoder.parameters()},
+    #     {'params': model.coordinate_head.parameters()}
+    # ], lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1,
                                                    patience=SCHEDULER_PATIENCE, verbose=True)
     
@@ -60,9 +99,7 @@ def train():
 
     best_val_loss = float('inf')
     iterations_list, train_loss_list, val_loss_list = [], [], []
-    if os.path.exists(LOG_FILE_PATH):
-        try: os.remove(LOG_FILE_PATH)
-        except OSError as e: print(f"Warning: Could not remove log file: {e}")
+    # Log file is now handled by log_hyperparameters and append mode later
 
     print("Starting training...")
     pbar = tqdm(range(1, TOTAL_ITERATIONS + 1), desc=f"Iteration 1/{TOTAL_ITERATIONS}", unit="iter")
@@ -112,7 +149,14 @@ def train():
             total_val_loss, total_val_samples = 0.0, 0
             with torch.no_grad():
                 for i in range(VALIDATION_BATCHES):
-                    set_seed(SEED + iteration + i)
+                    # Validation set seeding: The current method set_seed(SEED + iteration + i)
+                    # re-seeds for each validation batch. This means augmentations for validation
+                    # samples can vary slightly across validation phases. This can provide a more
+                    # robust average validation score over time.
+                    # If perfectly identical validation augmentations are needed for each validation
+                    # phase, seed once before the validation loop and ensure dataset generation is deterministic.
+                    set_seed(SEED + iteration + i) 
+                    
                     # MODIFIED: val_tgt_psf -> val_tgt_coords
                     val_img, val_in_psf, val_tgt_coords = generate_batch(
                         val_image_paths, val_gt_paths, BATCH_SIZE,
@@ -131,7 +175,7 @@ def train():
 
             random.setstate(rng_state['random']); np.random.set_state(rng_state['numpy']); torch.set_rng_state(rng_state['torch'])
             if rng_state['cuda'] and torch.cuda.is_available(): torch.cuda.set_rng_state_all(rng_state['cuda'])
-            set_seed(SEED + iteration + VALIDATION_BATCHES + 1)
+            set_seed(SEED + iteration + VALIDATION_BATCHES + 1) # Re-seed for subsequent training
 
             average_val_loss = total_val_loss / total_val_samples if total_val_samples > 0 else float('inf')
             iterations_list.append(iteration); train_loss_list.append(avg_train_loss); val_loss_list.append(average_val_loss)
