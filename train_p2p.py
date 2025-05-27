@@ -5,6 +5,7 @@ Iterative Crowd Counting Model Training Script (Coordinate Regression Hybrid)
 import os
 import torch
 import torch.optim as optim
+from torch.optim.lr_scheduler import CosineAnnealingLR # MODIFIED: Import CosineAnnealingLR
 from torch.cuda.amp import GradScaler, autocast
 from tqdm import tqdm
 import matplotlib.pyplot as plt
@@ -14,14 +15,14 @@ import json # For logging config
 
 from config_p2p import (
     DEVICE, SEED, TOTAL_ITERATIONS, BATCH_SIZE, LEARNING_RATE, WEIGHT_DECAY,
-    VALIDATION_INTERVAL, VALIDATION_BATCHES, SCHEDULER_PATIENCE,
+    VALIDATION_INTERVAL, VALIDATION_BATCHES, SCHEDULER_PATIENCE, # SCHEDULER_PATIENCE will be unused by CosineAnnealingLR
     IMAGE_DIR_TRAIN_VAL, GT_DIR_TRAIN_VAL, OUTPUT_DIR, LOG_FILE_PATH, BEST_MODEL_PATH,
     AUGMENTATION_SIZE, MODEL_INPUT_SIZE, GT_PSF_SIGMA
 )
 from utils import set_seed, find_and_sort_paths, split_train_val
 from dataset_p2p import generate_batch, generate_train_sample
 from model_p2p import VGG19FPNASPP
-from losses_p2p import coordinate_regression_loss # MODIFIED
+from losses_p2p import coordinate_regression_loss
 
 def log_hyperparameters(log_file_path, config_module):
     """Logs hyperparameters from the config module to the log file."""
@@ -54,16 +55,13 @@ def train():
 
 
     sorted_image_paths_train_val = find_and_sort_paths(IMAGE_DIR_TRAIN_VAL, '*.jpg')
-    # For GT paths, dataset.py handles matching, so a placeholder list or actual list can be used
-    # If GTs are not 1-to-1 named with images, ensure dataset.py logic for finding GT is robust
-    # For this example, assume find_and_sort_paths for GTs is also somewhat meaningful or dataset.py's fallback works.
     sorted_gt_paths_train_val = find_and_sort_paths(GT_DIR_TRAIN_VAL, '*.mat') 
-    if not sorted_gt_paths_train_val: # If GT dir is empty/not found, provide a dummy list for split_train_val
+    if not sorted_gt_paths_train_val:
         print("Warning: GT paths list is empty. `split_train_val` might behave unexpectedly if it relies on len(gt_paths).")
         sorted_gt_paths_train_val = [None] * len(sorted_image_paths_train_val)
 
 
-    if not sorted_image_paths_train_val: # Removed check for sorted_gt_paths_train_val here as it might be dummy
+    if not sorted_image_paths_train_val:
         raise FileNotFoundError("Training/Validation images not found. Check paths in config.py.")
 
     train_image_paths, train_gt_paths, val_image_paths, val_gt_paths = split_train_val(
@@ -74,24 +72,15 @@ def train():
 
     model = VGG19FPNASPP().to(DEVICE)
     
-    # For potential future improvement: Different learning rates for backbone vs. other parts
-    # Example:
-    # optimizer = optim.AdamW([
-    #     {'params': model.image_encoder.parameters(), 'lr': LEARNING_RATE * 0.1},
-    #     {'params': model.mask_encoder.parameters()},
-    #     {'params': model.fusion_conv_c5.parameters()},
-    #     {'params': model.aspp_c5.parameters()},
-    #     {'params': model.fpn_decoder.parameters()},
-    #     {'params': model.coordinate_head.parameters()}
-    # ], lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
 
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1,
-                                                   patience=SCHEDULER_PATIENCE, verbose=True)
+    # MODIFIED: Use CosineAnnealingLR scheduler
+    # SCHEDULER_PATIENCE from config is not used by CosineAnnealingLR.
+    # T_max is the total number of iterations. eta_min is the minimum learning rate.
+    scheduler = CosineAnnealingLR(optimizer, T_max=TOTAL_ITERATIONS, eta_min=1e-6) 
+    print(f"Using CosineAnnealingLR scheduler with T_max={TOTAL_ITERATIONS}, eta_min=1e-6.")
     
-    criterion = coordinate_regression_loss # MODIFIED (function itself, not instance if stateless)
-                                         # Or if it's a class: criterion = CoordinateRegressionLoss().to(DEVICE)
-                                         # Our current loss is a function, so this is fine.
+    criterion = coordinate_regression_loss 
 
     use_amp = DEVICE.type == 'cuda'
     scaler = GradScaler(enabled=use_amp)
@@ -99,7 +88,6 @@ def train():
 
     best_val_loss = float('inf')
     iterations_list, train_loss_list, val_loss_list = [], [], []
-    # Log file is now handled by log_hyperparameters and append mode later
 
     print("Starting training...")
     pbar = tqdm(range(1, TOTAL_ITERATIONS + 1), desc=f"Iteration 1/{TOTAL_ITERATIONS}", unit="iter")
@@ -107,38 +95,50 @@ def train():
 
     for iteration in pbar:
         model.train()
-        # MODIFIED: tgt_psf_batch -> tgt_coords_batch
         img_batch, in_psf_batch, tgt_coords_batch = generate_batch(
             train_image_paths, train_gt_paths, BATCH_SIZE,
             generation_fn=generate_train_sample,
             augment_size=AUGMENTATION_SIZE,
             model_input_size=MODEL_INPUT_SIZE,
-            psf_sigma=GT_PSF_SIGMA # Still used for input PSF generation
+            psf_sigma=GT_PSF_SIGMA
         )
 
         if img_batch is None:
             print(f"Warning: Failed to generate training batch at iter {iteration}. Skipping.")
+            # MODIFIED: Step scheduler even if batch generation fails to keep it in sync with iterations
+            if scheduler: scheduler.step() 
             continue
 
         img_batch = img_batch.to(DEVICE)
         in_psf_batch = in_psf_batch.to(DEVICE)
-        tgt_coords_batch = tgt_coords_batch.to(DEVICE) # MODIFIED
+        tgt_coords_batch = tgt_coords_batch.to(DEVICE)
 
         optimizer.zero_grad()
         with autocast(enabled=use_amp):
-            predicted_coords = model(img_batch, in_psf_batch) # MODIFIED output name
-            loss = criterion(predicted_coords, tgt_coords_batch) # MODIFIED
+            predicted_coords = model(img_batch, in_psf_batch)
+            loss = criterion(predicted_coords, tgt_coords_batch)
 
         scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()
+        
+        # MODIFIED: Step the CosineAnnealingLR scheduler each iteration
+        scheduler.step() 
 
         train_loss_accum += loss.item() * img_batch.size(0)
         samples_in_accum += img_batch.size(0)
 
-        if iteration == 1 and BATCH_SIZE > 0: # Print for the first batch
-            print("Sample Predicted Coords (first 5):", predicted_coords.detach().cpu().numpy()[:5])
-            print("Sample Target Coords (first 5):", tgt_coords_batch.detach().cpu().numpy()[:5])
+        # MODIFIED: Print predicted and target coordinates for the first batch
+        if iteration == 1 and BATCH_SIZE > 0 and predicted_coords is not None and tgt_coords_batch is not None:
+            print("\n--- First Batch Coordinate Comparison (Normalized [0,1]) ---")
+            num_to_print = min(5, predicted_coords.size(0))
+            preds_to_print = predicted_coords.detach().cpu().numpy()[:num_to_print]
+            tgts_to_print = tgt_coords_batch.detach().cpu().numpy()[:num_to_print]
+            for i in range(num_to_print):
+                print(f"  Sample {i+1}: Pred: [{preds_to_print[i,0]:.3f}, {preds_to_print[i,1]:.3f}], "
+                      f"Target: [{tgts_to_print[i,0]:.3f}, {tgts_to_print[i,1]:.3f}]")
+            print("------------------------------------------------------------")
+
 
         if iteration % VALIDATION_INTERVAL == 0:
             avg_train_loss = train_loss_accum / samples_in_accum if samples_in_accum > 0 else 0.0
@@ -149,33 +149,26 @@ def train():
             total_val_loss, total_val_samples = 0.0, 0
             with torch.no_grad():
                 for i in range(VALIDATION_BATCHES):
-                    # Validation set seeding: The current method set_seed(SEED + iteration + i)
-                    # re-seeds for each validation batch. This means augmentations for validation
-                    # samples can vary slightly across validation phases. This can provide a more
-                    # robust average validation score over time.
-                    # If perfectly identical validation augmentations are needed for each validation
-                    # phase, seed once before the validation loop and ensure dataset generation is deterministic.
                     set_seed(SEED + iteration + i) 
                     
-                    # MODIFIED: val_tgt_psf -> val_tgt_coords
                     val_img, val_in_psf, val_tgt_coords = generate_batch(
                         val_image_paths, val_gt_paths, BATCH_SIZE,
                         generation_fn=generate_train_sample,
                         augment_size=AUGMENTATION_SIZE, model_input_size=MODEL_INPUT_SIZE, psf_sigma=GT_PSF_SIGMA
                     )
                     if val_img is None: continue
-                    val_img, val_in_psf, val_tgt_coords = val_img.to(DEVICE), val_in_psf.to(DEVICE), val_tgt_coords.to(DEVICE) # MODIFIED
+                    val_img, val_in_psf, val_tgt_coords = val_img.to(DEVICE), val_in_psf.to(DEVICE), val_tgt_coords.to(DEVICE)
 
                     with autocast(enabled=use_amp):
-                        val_pred_coords = model(val_img, val_in_psf) # MODIFIED output name
-                        batch_loss = criterion(val_pred_coords, val_tgt_coords) # MODIFIED
+                        val_pred_coords = model(val_img, val_in_psf)
+                        batch_loss = criterion(val_pred_coords, val_tgt_coords)
                     
                     total_val_loss += batch_loss.item() * val_img.size(0)
                     total_val_samples += val_img.size(0)
 
             random.setstate(rng_state['random']); np.random.set_state(rng_state['numpy']); torch.set_rng_state(rng_state['torch'])
             if rng_state['cuda'] and torch.cuda.is_available(): torch.cuda.set_rng_state_all(rng_state['cuda'])
-            set_seed(SEED + iteration + VALIDATION_BATCHES + 1) # Re-seed for subsequent training
+            set_seed(SEED + iteration + VALIDATION_BATCHES + 1)
 
             average_val_loss = total_val_loss / total_val_samples if total_val_samples > 0 else float('inf')
             iterations_list.append(iteration); train_loss_list.append(avg_train_loss); val_loss_list.append(average_val_loss)
@@ -186,14 +179,14 @@ def train():
 
             with open(LOG_FILE_PATH, "a") as log_file: log_file.write(log_message + "\n")
             
-            scheduler.step(average_val_loss)
+            # MODIFIED: scheduler.step(average_val_loss) is removed as CosineAnnealingLR steps per iteration.
             if average_val_loss < best_val_loss:
                 best_val_loss = average_val_loss
                 torch.save(model.state_dict(), BEST_MODEL_PATH)
                 print(f"    -> New best model saved with Val Loss: {best_val_loss:.4f}")
             
             train_loss_accum, samples_in_accum = 0.0, 0
-        pbar.set_description(f"Iter {iteration}/{TOTAL_ITERATIONS} | Last Batch Loss: {loss.item():.4f}")
+        pbar.set_description(f"Iter {iteration}/{TOTAL_ITERATIONS} | Last Batch Loss: {loss.item():.4f} | LR: {optimizer.param_groups[0]['lr']:.2e}")
 
     print("Training complete!")
     pbar.close()
@@ -201,11 +194,11 @@ def train():
     plt.figure(figsize=(10, 5))
     plt.plot(iterations_list, train_loss_list, label='Train Loss')
     plt.plot(iterations_list, val_loss_list, label='Validation Loss')
-    plt.title("Training and Validation Loss (Coordinate Regression) over Iterations") # MODIFIED
+    plt.title("Training and Validation Loss (Coordinate Regression) over Iterations")
     plt.xlabel("Iteration")
-    plt.ylabel("Coordinate Regression Loss (e.g., MSE)") # MODIFIED
+    plt.ylabel("Coordinate Regression Loss (e.g., MSE)")
     plt.legend(); plt.grid(True); plt.ylim(bottom=0); plt.tight_layout()
-    plot_path = os.path.join(OUTPUT_DIR, "training_loss_plot_coordreg.png") # MODIFIED
+    plot_path = os.path.join(OUTPUT_DIR, "training_loss_plot_coordreg.png")
     plt.savefig(plot_path); plt.close()
 
     print(f"Plots saved to: {OUTPUT_DIR}")
