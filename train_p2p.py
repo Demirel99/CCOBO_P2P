@@ -1,4 +1,4 @@
-#train.py
+#train_p2p.py
 """
 Iterative Crowd Counting Model Training Script (Coordinate Regression Hybrid)
 """
