@@ -1,4 +1,4 @@
-#losses.py
+#losses_p2p.py
 """
 Loss functions for model training.
 """
