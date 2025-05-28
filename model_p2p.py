@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from torchvision import models
 
 # Import from config
-from config import PSF_HEAD_TEMP, MODEL_INPUT_SIZE # MODEL_INPUT_SIZE not directly used here for layer defs
+from config_p2p import MODEL_INPUT_SIZE # Corrected: PSF_HEAD_TEMP not in config_p2p and not used.
 
 class ASPP(nn.Module):
     """Atrous Spatial Pyramid Pooling (ASPP) module."""
