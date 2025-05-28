@@ -1,4 +1,4 @@
-#config.py
+#config_p2p.py
 """
 Configuration settings for the Iterative Crowd Counting Model.
 """
